@@ -7,6 +7,7 @@
 #include <TFT_eSPI.h>
 #include "modelo_ia.h" 
 
+// Declaração limpa e única do display
 TFT_eSPI tft = TFT_eSPI();
 
 // --- CONFIGURAÇÕES DE REDE E ACESSO ---
@@ -20,20 +21,13 @@ WiFiClientSecure client;
 UniversalTelegramBot bot(BOTtoken, client);
 Eloquent::ML::Port::RandomForest ia;
 
-// --- CONTROLE DE ESTADO E TOUCH ---
-bool executandoTeste = false; // false = Tela de Menu | true = Rodando Ping/IA
-uint16_t touchX = 0, touchY = 0;
+void displayMetrics(float rtt, float jitter, float perda, float desvio, const String &status);
 
 const int TAMANHO_JANELA = 10;
 int historicoPredicoes[TAMANHO_JANELA];
 int indiceJanela = 0;
 unsigned long ultimoAlertaTelegram = 0;
 const unsigned long INTERVALO_MSG = 60000; 
-
-// Declaração de funções auxiliares da interface
-void desenharMenuInicial();
-void desenharTelaMonitoramento();
-void displayMetrics(float rtt, float jitter, float perda, float desvio, const String &status);
 
 void setup() {
     Serial.begin(115200);
@@ -45,44 +39,25 @@ void setup() {
     
     for(int i=0; i<TAMANHO_JANELA; i++) historicoPredicoes[i] = 0;
     
+    Serial.println("\n--- MONITOR DE BORDA: FINGERPRINTING ATIVO ---");
+    bot.sendMessage(CHAT_ID, "🛡️ Monitoramento Iniciado.\nPor Luis Henrike and Marcelino Camilo", "");
+    
     #ifdef TFT_BL
         pinMode(TFT_BL, OUTPUT);
         digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
     #endif
 
     tft.init();
-    tft.setRotation(0); // Orientação retrato vertical
     
-    // Inicia desenhando a tela de Menu e esperando o operador
-    desenharMenuInicial();
+    // Rotação 0 ou 2 para modo Retrato vertical com a tela preta preenchendo 100%
+    tft.setRotation(1); 
+    tft.fillScreen(TFT_BLACK);
+    
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
 void loop() {
-    // Captura se houve um toque físico na tela e salva as coordenadas em touchX e touchY
-    bool tocou = tft.getTouch(&touchX, &touchY);
-
-    // =================================================================
-    // ESTADO 1: SISTEMA EM ESPERA (MENU INICIAL)
-    // =================================================================
-    if (!executandoTeste) {
-        if (tocou) {
-            // Hitbox do botão INICIAR (X entre 30 e 210 | Y entre 130 e 190)
-            if (touchX >= 30 && touchX <= 210 && touchY >= 130 && touchY <= 190) {
-                executandoTeste = true;
-                desenharTelaMonitoramento();
-                bot.sendMessage(CHAT_ID, "▶️ *TESTE INICIADO* pelo terminal local.", "Markdown");
-                delay(400); // Debounce para o dedo não clicar duas vezes
-                return;
-            }
-        }
-        delay(50); // Mantém a CPU descansando enquanto ninguém toca na tela
-        return;    // Aborta o loop aqui! Impede que o código de ping abaixo rode.
-    }
-
-    // =================================================================
-    // ESTADO 2: EXECUTANDO MONITORAMENTO DE REDE E IA
-    // =================================================================
-    
     float rtt_soma = 0, rtt_antigo = 0, jitter_soma = 0;
     float rtt_min = 9999.0, rtt_max = 0.0;
     int sucessos = 0;
@@ -124,112 +99,85 @@ void loop() {
     bool alertaReal = false;
 
     if (contagemAtaque >= 7) { 
-        if (desvio_assinatura < 10.0 && rtt_medio > 80.0) {
+        if (sinalWifi < -80) {
+            statusRede = "INSTAVEL (SINAL FRACO)";
+        } 
+        else if (desvio_assinatura < 10.0 && rtt_medio > 80.0) {
             statusRede = "ATAQUE! ASSINATURA CONFIRMADA";
             alertaReal = true;
-        } else if (perda > 25.0) {
+        } 
+        else if (perda > 25.0) {
             statusRede = "FALHA DE CONEXÃO";
             alertaReal = true;
-        } else {
+        } 
+        else {
             statusRede = "TRAFEGO SUSPEITO";
         }
     }
 
+    Serial.printf("RTT: %.2fms | JIT: %.2fms | LOSS: %.0f%% | DEV: %.2fms | STATUS: %s (%d/10)\n", 
+                  rtt_medio, jitter, perda, desvio_assinatura, statusRede.c_str(), contagemAtaque);
+                  
     displayMetrics(rtt_medio, jitter, perda, desvio_assinatura, statusRede);
     
-    // Alerta Telegram
     if (alertaReal && (millis() - ultimoAlertaTelegram > INTERVALO_MSG)) {
-        String msg = "🚨 *DETECÇÃO DE INTRUSÃO (DDoS)*\n📍 *ALVO:* `" + remote_ip.toString() + "`\n";
+        String msg = "🚨 *DETECÇÃO DE INTRUSÃO (DDoS)*\n\n";
+        msg += "📍 *ALVO:* `" + remote_ip.toString() + "`\n";
+        msg += "📊 *ESTATÍSTICAS DO EVENTO:*\n";
         msg += "└ RTT Médio: `" + String(rtt_medio, 2) + " ms`\n";
-        msg += "✅ *Status:* Confirmado por Edge AI (" + String(contagemAtaque) + "/10)";
-        if(bot.sendMessage(CHAT_ID, msg, "Markdown")) ultimoAlertaTelegram = millis();
-    }
-
-    // --- ESCUTA FRACIONADA DO BOTÃO "PARAR" ---
-    // Em vez de dar um delay(1000) cego, fatiamos a espera em 10 pedaços de 100ms.
-    // Isso garante que se o usuário tocar no botão PARAR, a tela responda quase instantaneamente.
-    for (int d = 0; d < 10; d++) {
-        if (tft.getTouch(&touchX, &touchY)) {
-            // Hitbox do botão PARAR no rodapé (X: 60 a 180 | Y: 260 a 305)
-            if (touchX >= 60 && touchX <= 180 && touchY >= 260 && touchY <= 305) {
-                executandoTeste = false;
-                bot.sendMessage(CHAT_ID, "⏹️ *TESTE ABORTADO* pelo operador local.", "Markdown");
-                desenharMenuInicial();
-                delay(400);
-                return;
-            }
+        msg += "└ Jitter: `" + String(jitter, 2) + " ms`\n";
+        msg += "└ Perda (Loss): `" + String(perda, 0) + " %`\n";
+        msg += "└ Desvio (DEV): `" + String(desvio_assinatura, 2) + " ms`\n\n";
+        
+        msg += "🔍 *ANÁLISE DE ASSINATURA:*\n";
+        if (statusRede.indexOf("FINGERPRINT") != -1) {
+            msg += "└ *Tipo:* Flood Persistente (Alta freq.)\n";
+            msg += "└ *Origem:* Fluxo de IP Sintético (Script).\n";
+        } else {
+            msg += "└ *Tipo:* Saturação de Banda/Buffer\n";
+            msg += "└ *Origem:* Múltiplas requisições persistentes.\n";
         }
-        delay(100);
+        
+        msg += "\n✅ *Status:* Confirmado por Edge AI (" + String(contagemAtaque) + "/10)";
+        
+        if(bot.sendMessage(CHAT_ID, msg, "Markdown")) {
+            ultimoAlertaTelegram = millis();
+        }
     }
-}
 
-// =================================================================
-// FUNÇÕES DE DESENHO DA INTERFACE (IHM)
-// =================================================================
-
-void desenharMenuInicial() {
-    tft.fillScreen(TFT_BLACK);
-    
-    // Cabeçalho
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawCentreString("CYD SECURE EDGE", 120, 30, 2);
-    
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString("Alvo: " + remote_ip.toString(), 120, 60, 2);
-
-    // Botão INICIAR (Retângulo verde centralizado)
-    tft.fillRoundRect(30, 130, 180, 60, 8, TFT_GREEN);
-    tft.drawRoundRect(30, 130, 180, 60, 8, TFT_WHITE);
-    
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_BLACK, TFT_GREEN);
-    tft.drawCentreString("INICIAR", 120, 150, 2);
-
-    // Instrução de rodapé
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    tft.drawCentreString("Toque para injetar pacotes", 120, 280, 1);
-}
-
-void desenharTelaMonitoramento() {
-    tft.fillScreen(TFT_BLACK);
-    
-    // Desenha o botão vermelho de PARAR fixo no rodapé
-    tft.fillRoundRect(60, 260, 120, 45, 6, TFT_RED);
-    tft.drawRoundRect(60, 260, 120, 45, 6, TFT_WHITE);
-    
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.drawCentreString("PARAR", 120, 275, 2);
+    delay(1000);
 }
 
 void displayMetrics(float rtt, float jitter, float perda, float desvio, const String &status) {
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     
-    tft.setCursor(5, 5, 2);
+    tft.setCursor(5, 0, 2);
     tft.printf("RTT: %-6.1f ms   ", rtt); 
     
-    tft.setCursor(5, 35, 2); 
+    tft.setCursor(5, 30, 2); 
     tft.printf("JIT: %-6.1f ms   ", jitter);
     
-    tft.setCursor(5, 65, 2);
+    tft.setCursor(5, 60, 2);
     tft.printf("LOSS: %-3.0f %%    ", perda);
     
-    tft.setCursor(5, 95, 2);
+    tft.setCursor(5, 90, 2);
     tft.printf("DEV: %-6.1f ms   ", desvio);
 
     tft.setTextSize(2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setCursor(5, 140, 1);
+    tft.setCursor(5, 130, 1);
     tft.print("STATUS:                 "); 
     
-    tft.setCursor(5, 165, 1);
-    if (status == "SEGURO") tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    else if (status.indexOf("ATAQUE") != -1) tft.setTextColor(TFT_RED, TFT_BLACK);
-    else tft.setTextColor(TFT_ORANGE, TFT_BLACK); 
+    tft.setCursor(5, 155, 1);
+    
+    if (status == "SEGURO") {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    } else if (status.indexOf("ATAQUE") != -1 || status.indexOf("FALHA") != -1) {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+    } else {
+        tft.setTextColor(TFT_ORANGE, TFT_BLACK); 
+    }
     
     tft.print(status + "                 "); 
 }
